@@ -1,0 +1,721 @@
+/*
+    ============================================================
+     LIBRARY MANAGEMENT SYSTEM (Revised)
+    ============================================================
+    A console-based Library Management System built using
+    Object-Oriented Programming in C++.
+
+    Revision changes (v2):
+      - Proper encapsulation: all class fields are private,
+        accessed only through getters/setters.
+      - Input validation on every user entry (no empty titles/
+        names, no negative copies, numeric IDs only).
+      - Duplicate-safe IDs and duplicate-book detection.
+      - Update and Delete operations for both Books and Members
+        (full CRUD, not just Add/View).
+      - Issue records now store a due date; returning a book
+        after the due date calculates a fine.
+      - Defensive file parsing with exception handling, so a
+        corrupted data line cannot crash the program.
+
+    Features:
+      - Add / update / delete / view Book records
+      - Add / update / delete / view Member records
+      - Issue a book to a member (with a due date)
+      - Return a book (auto-calculates late fine if overdue)
+      - Search books by Title or Author
+      - View currently issued books
+      - Persist data to text files (books.txt, members.txt, issued.txt)
+
+    Compile:
+      g++ -std=c++17 -o library library_management_system.cpp
+    Run:
+      ./library
+    ============================================================
+*/
+
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <limits>
+#include <iomanip>
+#include <stdexcept>
+
+using namespace std;
+
+// ------------------------------------------------------------
+// Constants
+// ------------------------------------------------------------
+const int LOAN_PERIOD_DAYS = 14;   // standard borrowing period
+const double FINE_PER_DAY = 5.0;   // fine per day overdue (currency units)
+
+// ------------------------------------------------------------
+// Utility helpers
+// ------------------------------------------------------------
+string toLower(const string &s) {
+    string result = s;
+    transform(result.begin(), result.end(), result.begin(), ::tolower);
+    return result;
+}
+
+bool containsIgnoreCase(const string &haystack, const string &needle) {
+    return toLower(haystack).find(toLower(needle)) != string::npos;
+}
+
+string trim(const string &s) {
+    size_t start = s.find_first_not_of(" \t\r\n");
+    if (start == string::npos) return "";
+    size_t end = s.find_last_not_of(" \t\r\n");
+    return s.substr(start, end - start + 1);
+}
+
+int readInt(const string &prompt) {
+    int value;
+    while (true) {
+        cout << prompt;
+        if (cin >> value) {
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
+            return value;
+        }
+        cout << "Invalid input. Please enter a whole number.\n";
+        cin.clear();
+        cin.ignore(numeric_limits<streamsize>::max(), '\n');
+    }
+}
+
+// Reads a positive integer (>0). Used for copy counts, days, etc.
+int readPositiveInt(const string &prompt) {
+    while (true) {
+        int value = readInt(prompt);
+        if (value > 0) return value;
+        cout << "Value must be greater than zero. Try again.\n";
+    }
+}
+
+// Reads a non-empty line of text, re-prompting until valid.
+string readNonEmptyLine(const string &prompt) {
+    string value;
+    while (true) {
+        cout << prompt;
+        getline(cin, value);
+        value = trim(value);
+        if (!value.empty()) return value;
+        cout << "This field cannot be empty. Please try again.\n";
+    }
+}
+
+string readLine(const string &prompt) {
+    string value;
+    cout << prompt;
+    getline(cin, value);
+    return trim(value);
+}
+
+// Very small integer-encoded date helper: dates are entered as
+// YYYYMMDD (e.g. 20260824) so they can be compared and offset
+// numerically without pulling in <chrono>/<ctime> complexity.
+int readDateYYYYMMDD(const string &prompt) {
+    while (true) {
+        int value = readInt(prompt);
+        string s = to_string(value);
+        if (s.size() == 8) return value;
+        cout << "Please enter the date as YYYYMMDD, e.g. 20260824.\n";
+    }
+}
+
+// Adds `days` to a YYYYMMDD-encoded date using a simple month-length
+// table. Good enough for a library loan period; not a full calendar
+// library, but avoids external date dependencies.
+int addDaysToDate(int yyyymmdd, int days) {
+    int year = yyyymmdd / 10000;
+    int month = (yyyymmdd / 100) % 100;
+    int day = yyyymmdd % 100;
+
+    auto isLeap = [](int y) {
+        return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+    };
+    auto daysInMonth = [&](int y, int m) {
+        static const int base[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+        if (m == 2 && isLeap(y)) return 29;
+        return base[m - 1];
+    };
+
+    day += days;
+    while (day > daysInMonth(year, month)) {
+        day -= daysInMonth(year, month);
+        month++;
+        if (month > 12) { month = 1; year++; }
+    }
+    return year * 10000 + month * 100 + day;
+}
+
+// ------------------------------------------------------------
+// Book class - encapsulated (OOP principle: data hiding)
+// ------------------------------------------------------------
+class Book {
+private:
+    int bookId;
+    string title;
+    string author;
+    int totalCopies;
+    int availableCopies;
+
+public:
+    Book() : bookId(0), totalCopies(0), availableCopies(0) {}
+
+    Book(int id, string t, string a, int total, int available)
+        : bookId(id), title(move(t)), author(move(a)),
+          totalCopies(total), availableCopies(available) {}
+
+    // ---- Getters ----
+    int getId() const { return bookId; }
+    string getTitle() const { return title; }
+    string getAuthor() const { return author; }
+    int getTotalCopies() const { return totalCopies; }
+    int getAvailableCopies() const { return availableCopies; }
+
+    // ---- Setters (validated) ----
+    void setTitle(const string &t) { if (!t.empty()) title = t; }
+    void setAuthor(const string &a) { if (!a.empty()) author = a; }
+
+    void setTotalCopies(int total) {
+        int issuedOut = totalCopies - availableCopies;
+        if (total < issuedOut) {
+            throw invalid_argument("Total copies cannot be less than copies currently issued out.");
+        }
+        availableCopies += (total - totalCopies);
+        totalCopies = total;
+    }
+
+    bool issueCopy() {
+        if (availableCopies <= 0) return false;
+        availableCopies--;
+        return true;
+    }
+
+    void returnCopy() {
+        if (availableCopies < totalCopies) availableCopies++;
+    }
+
+    string toFileString() const {
+        ostringstream oss;
+        oss << bookId << "|" << title << "|" << author << "|"
+            << totalCopies << "|" << availableCopies;
+        return oss.str();
+    }
+
+    static Book fromFileString(const string &line) {
+        stringstream ss(line);
+        string idStr, title, author, totalStr, availStr;
+        getline(ss, idStr, '|');
+        getline(ss, title, '|');
+        getline(ss, author, '|');
+        getline(ss, totalStr, '|');
+        getline(ss, availStr, '|');
+        return Book(stoi(idStr), title, author, stoi(totalStr), stoi(availStr));
+    }
+
+    void display() const {
+        cout << left << setw(6) << bookId
+             << setw(30) << title
+             << setw(20) << author
+             << setw(8) << totalCopies
+             << setw(10) << availableCopies << "\n";
+    }
+};
+
+// ------------------------------------------------------------
+// Member class - encapsulated
+// ------------------------------------------------------------
+class Member {
+private:
+    int memberId;
+    string name;
+    string contact;
+
+public:
+    Member() : memberId(0) {}
+
+    Member(int id, string n, string c)
+        : memberId(id), name(move(n)), contact(move(c)) {}
+
+    int getId() const { return memberId; }
+    string getName() const { return name; }
+    string getContact() const { return contact; }
+
+    void setName(const string &n) { if (!n.empty()) name = n; }
+    void setContact(const string &c) { if (!c.empty()) contact = c; }
+
+    string toFileString() const {
+        ostringstream oss;
+        oss << memberId << "|" << name << "|" << contact;
+        return oss.str();
+    }
+
+    static Member fromFileString(const string &line) {
+        stringstream ss(line);
+        string idStr, name, contact;
+        getline(ss, idStr, '|');
+        getline(ss, name, '|');
+        getline(ss, contact, '|');
+        return Member(stoi(idStr), name, contact);
+    }
+
+    void display() const {
+        cout << left << setw(6) << memberId
+             << setw(25) << name
+             << setw(15) << contact << "\n";
+    }
+};
+
+// ------------------------------------------------------------
+// IssueRecord class - links a Book to a Member, tracks due date
+// ------------------------------------------------------------
+class IssueRecord {
+private:
+    int bookId;
+    int memberId;
+    int issueDate;   // YYYYMMDD
+    int dueDate;      // YYYYMMDD
+
+public:
+    IssueRecord() : bookId(0), memberId(0), issueDate(0), dueDate(0) {}
+
+    IssueRecord(int bId, int mId, int issue, int due)
+        : bookId(bId), memberId(mId), issueDate(issue), dueDate(due) {}
+
+    int getBookId() const { return bookId; }
+    int getMemberId() const { return memberId; }
+    int getIssueDate() const { return issueDate; }
+    int getDueDate() const { return dueDate; }
+
+    string toFileString() const {
+        ostringstream oss;
+        oss << bookId << "|" << memberId << "|" << issueDate << "|" << dueDate;
+        return oss.str();
+    }
+
+    static IssueRecord fromFileString(const string &line) {
+        stringstream ss(line);
+        string bStr, mStr, issueStr, dueStr;
+        getline(ss, bStr, '|');
+        getline(ss, mStr, '|');
+        getline(ss, issueStr, '|');
+        getline(ss, dueStr, '|');
+        return IssueRecord(stoi(bStr), stoi(mStr), stoi(issueStr), stoi(dueStr));
+    }
+};
+
+// ------------------------------------------------------------
+// Library class - manages all data and operations
+// ------------------------------------------------------------
+class Library {
+private:
+    vector<Book> books;
+    vector<Member> members;
+    vector<IssueRecord> issuedRecords;
+
+    const string BOOKS_FILE = "books.txt";
+    const string MEMBERS_FILE = "members.txt";
+    const string ISSUED_FILE = "issued.txt";
+
+    int nextBookId() const {
+        int maxId = 0;
+        for (const auto &b : books) maxId = max(maxId, b.getId());
+        return maxId + 1;
+    }
+
+    int nextMemberId() const {
+        int maxId = 0;
+        for (const auto &m : members) maxId = max(maxId, m.getId());
+        return maxId + 1;
+    }
+
+    Book* findBookById(int id) {
+        for (auto &b : books) if (b.getId() == id) return &b;
+        return nullptr;
+    }
+
+    Member* findMemberById(int id) {
+        for (auto &m : members) if (m.getId() == id) return &m;
+        return nullptr;
+    }
+
+    bool isBookIssued(int bookId) const {
+        for (const auto &r : issuedRecords) if (r.getBookId() == bookId) return true;
+        return false;
+    }
+
+    bool isMemberHoldingBooks(int memberId) const {
+        for (const auto &r : issuedRecords) if (r.getMemberId() == memberId) return true;
+        return false;
+    }
+
+public:
+    Library() {
+        loadBooks();
+        loadMembers();
+        loadIssuedRecords();
+    }
+
+    // ---------------- File I/O (defensive: skips bad lines) ----------------
+    void loadBooks() {
+        books.clear();
+        ifstream file(BOOKS_FILE);
+        string line;
+        while (getline(file, line)) {
+            if (line.empty()) continue;
+            try { books.push_back(Book::fromFileString(line)); }
+            catch (const exception &) { /* skip corrupted line */ }
+        }
+    }
+
+    void saveBooks() const {
+        ofstream file(BOOKS_FILE);
+        for (const auto &b : books) file << b.toFileString() << "\n";
+    }
+
+    void loadMembers() {
+        members.clear();
+        ifstream file(MEMBERS_FILE);
+        string line;
+        while (getline(file, line)) {
+            if (line.empty()) continue;
+            try { members.push_back(Member::fromFileString(line)); }
+            catch (const exception &) { /* skip corrupted line */ }
+        }
+    }
+
+    void saveMembers() const {
+        ofstream file(MEMBERS_FILE);
+        for (const auto &m : members) file << m.toFileString() << "\n";
+    }
+
+    void loadIssuedRecords() {
+        issuedRecords.clear();
+        ifstream file(ISSUED_FILE);
+        string line;
+        while (getline(file, line)) {
+            if (line.empty()) continue;
+            try { issuedRecords.push_back(IssueRecord::fromFileString(line)); }
+            catch (const exception &) { /* skip corrupted line */ }
+        }
+    }
+
+    void saveIssuedRecords() const {
+        ofstream file(ISSUED_FILE);
+        for (const auto &r : issuedRecords) file << r.toFileString() << "\n";
+    }
+
+    // ---------------- Book management ----------------
+    void addBook() {
+        string title = readNonEmptyLine("Enter book title: ");
+        string author = readNonEmptyLine("Enter author name: ");
+        int copies = readPositiveInt("Enter number of copies: ");
+
+        // Duplicate check: same title + author already exists
+        for (const auto &b : books) {
+            if (toLower(b.getTitle()) == toLower(title) && toLower(b.getAuthor()) == toLower(author)) {
+                cout << "This book already exists (ID " << b.getId()
+                     << "). Increasing its copy count instead.\n";
+                Book *existing = findBookById(b.getId());
+                existing->setTotalCopies(existing->getTotalCopies() + copies);
+                saveBooks();
+                return;
+            }
+        }
+
+        int id = nextBookId();
+        books.emplace_back(id, title, author, copies, copies);
+        saveBooks();
+        cout << "Book added successfully with ID: " << id << "\n";
+    }
+
+    void updateBook() {
+        int id = readInt("Enter Book ID to update: ");
+        Book *book = findBookById(id);
+        if (!book) { cout << "Book not found.\n"; return; }
+
+        cout << "Leave a field blank to keep its current value.\n";
+        string title = readLine("New title [" + book->getTitle() + "]: ");
+        string author = readLine("New author [" + book->getAuthor() + "]: ");
+
+        if (!title.empty()) book->setTitle(title);
+        if (!author.empty()) book->setAuthor(author);
+
+        string copiesStr = readLine("New total copies [" + to_string(book->getTotalCopies()) + "]: ");
+        if (!copiesStr.empty()) {
+            try {
+                int newTotal = stoi(copiesStr);
+                book->setTotalCopies(newTotal);
+            } catch (const exception &e) {
+                cout << "Could not update copy count: " << e.what() << "\n";
+            }
+        }
+
+        saveBooks();
+        cout << "Book updated successfully.\n";
+    }
+
+    void deleteBook() {
+        int id = readInt("Enter Book ID to delete: ");
+        if (isBookIssued(id)) {
+            cout << "Cannot delete: this book currently has copies issued out. Return them first.\n";
+            return;
+        }
+        auto it = find_if(books.begin(), books.end(), [&](const Book &b) { return b.getId() == id; });
+        if (it == books.end()) { cout << "Book not found.\n"; return; }
+        books.erase(it);
+        saveBooks();
+        cout << "Book deleted successfully.\n";
+    }
+
+    void viewAllBooks() const {
+        if (books.empty()) {
+            cout << "No books in the library yet.\n";
+            return;
+        }
+        cout << "\n" << left << setw(6) << "ID" << setw(30) << "Title"
+             << setw(20) << "Author" << setw(8) << "Total" << setw(10) << "Available" << "\n";
+        cout << string(74, '-') << "\n";
+        for (const auto &b : books) b.display();
+    }
+
+    // ---------------- Member management ----------------
+    void addMember() {
+        string name = readNonEmptyLine("Enter member name: ");
+        string contact = readNonEmptyLine("Enter contact (phone/email): ");
+
+        for (const auto &m : members) {
+            if (toLower(m.getContact()) == toLower(contact)) {
+                cout << "A member with this contact already exists (ID " << m.getId() << "). Skipping.\n";
+                return;
+            }
+        }
+
+        int id = nextMemberId();
+        members.emplace_back(id, name, contact);
+        saveMembers();
+        cout << "Member added successfully with ID: " << id << "\n";
+    }
+
+    void updateMember() {
+        int id = readInt("Enter Member ID to update: ");
+        Member *member = findMemberById(id);
+        if (!member) { cout << "Member not found.\n"; return; }
+
+        cout << "Leave a field blank to keep its current value.\n";
+        string name = readLine("New name [" + member->getName() + "]: ");
+        string contact = readLine("New contact [" + member->getContact() + "]: ");
+
+        if (!name.empty()) member->setName(name);
+        if (!contact.empty()) member->setContact(contact);
+
+        saveMembers();
+        cout << "Member updated successfully.\n";
+    }
+
+    void deleteMember() {
+        int id = readInt("Enter Member ID to delete: ");
+        if (isMemberHoldingBooks(id)) {
+            cout << "Cannot delete: this member currently has books issued. They must return them first.\n";
+            return;
+        }
+        auto it = find_if(members.begin(), members.end(), [&](const Member &m) { return m.getId() == id; });
+        if (it == members.end()) { cout << "Member not found.\n"; return; }
+        members.erase(it);
+        saveMembers();
+        cout << "Member deleted successfully.\n";
+    }
+
+    void viewAllMembers() const {
+        if (members.empty()) {
+            cout << "No members registered yet.\n";
+            return;
+        }
+        cout << "\n" << left << setw(6) << "ID" << setw(25) << "Name" << setw(15) << "Contact" << "\n";
+        cout << string(46, '-') << "\n";
+        for (const auto &m : members) m.display();
+    }
+
+    // ---------------- Issue / Return ----------------
+    void issueBook() {
+        if (books.empty() || members.empty()) {
+            cout << "Please make sure at least one book and one member exist first.\n";
+            return;
+        }
+
+        int bookId = readInt("Enter Book ID to issue: ");
+        Book *book = findBookById(bookId);
+        if (!book) { cout << "Book not found.\n"; return; }
+        if (book->getAvailableCopies() <= 0) {
+            cout << "No available copies of \"" << book->getTitle() << "\" right now.\n";
+            return;
+        }
+
+        int memberId = readInt("Enter Member ID: ");
+        Member *member = findMemberById(memberId);
+        if (!member) { cout << "Member not found.\n"; return; }
+
+        int issueDate = readDateYYYYMMDD("Enter issue date (YYYYMMDD, e.g. 20260824): ");
+        int dueDate = addDaysToDate(issueDate, LOAN_PERIOD_DAYS);
+
+        book->issueCopy();
+        issuedRecords.emplace_back(bookId, memberId, issueDate, dueDate);
+
+        saveBooks();
+        saveIssuedRecords();
+
+        cout << "Book \"" << book->getTitle() << "\" issued to " << member->getName()
+             << ". Due date: " << dueDate << " (" << LOAN_PERIOD_DAYS << "-day loan period).\n";
+    }
+
+    void returnBook() {
+        int bookId = readInt("Enter Book ID to return: ");
+        int memberId = readInt("Enter Member ID: ");
+
+        auto it = find_if(issuedRecords.begin(), issuedRecords.end(),
+            [&](const IssueRecord &r) { return r.getBookId() == bookId && r.getMemberId() == memberId; });
+
+        if (it == issuedRecords.end()) {
+            cout << "No matching issue record found for this book and member.\n";
+            return;
+        }
+
+        int returnDate = readDateYYYYMMDD("Enter return date (YYYYMMDD): ");
+        int dueDate = it->getDueDate();
+
+        Book *book = findBookById(bookId);
+        if (book) { book->returnCopy(); saveBooks(); }
+
+        if (returnDate > dueDate) {
+            // Difference in encoded YYYYMMDD form isn't a true day count for
+            // cross-month gaps, so fall back to a simple day-of-month delta
+            // when both dates share the same year/month, otherwise estimate.
+            int overdueDays;
+            int y1 = dueDate / 10000, m1 = (dueDate / 100) % 100, d1 = dueDate % 100;
+            int y2 = returnDate / 10000, m2 = (returnDate / 100) % 100, d2 = returnDate % 100;
+            if (y1 == y2 && m1 == m2) {
+                overdueDays = d2 - d1;
+            } else {
+                overdueDays = (y2 - y1) * 360 + (m2 - m1) * 30 + (d2 - d1); // rough estimate
+                if (overdueDays < 1) overdueDays = 1;
+            }
+            double fine = overdueDays * FINE_PER_DAY;
+            cout << "Book returned late by " << overdueDays << " day(s). Fine due: "
+                 << fixed << setprecision(2) << fine << "\n";
+        } else {
+            cout << "Book returned on time. No fine.\n";
+        }
+
+        issuedRecords.erase(it);
+        saveIssuedRecords();
+    }
+
+    void viewIssuedBooks() const {
+        if (issuedRecords.empty()) {
+            cout << "No books are currently issued.\n";
+            return;
+        }
+
+        cout << "\n" << left << setw(6) << "BookID" << setw(30) << "Title"
+             << setw(6) << "MemID" << setw(20) << "Member"
+             << setw(10) << "Issued" << setw(10) << "Due" << "\n";
+        cout << string(82, '-') << "\n";
+
+        for (const auto &r : issuedRecords) {
+            string title = "Unknown", memberName = "Unknown";
+            for (const auto &b : books) if (b.getId() == r.getBookId()) title = b.getTitle();
+            for (const auto &m : members) if (m.getId() == r.getMemberId()) memberName = m.getName();
+
+            cout << left << setw(6) << r.getBookId() << setw(30) << title
+                 << setw(6) << r.getMemberId() << setw(20) << memberName
+                 << setw(10) << r.getIssueDate() << setw(10) << r.getDueDate() << "\n";
+        }
+    }
+
+    // ---------------- Search ----------------
+    void searchBooks() const {
+        cout << "\nSearch by:\n1. Title\n2. Author\n";
+        int choice = readInt("Enter choice: ");
+        if (choice != 1 && choice != 2) { cout << "Invalid choice.\n"; return; }
+
+        string keyword = readNonEmptyLine("Enter search keyword: ");
+        bool found = false;
+
+        cout << "\n" << left << setw(6) << "ID" << setw(30) << "Title"
+             << setw(20) << "Author" << setw(8) << "Total" << setw(10) << "Available" << "\n";
+        cout << string(74, '-') << "\n";
+
+        for (const auto &b : books) {
+            bool match = (choice == 1) ? containsIgnoreCase(b.getTitle(), keyword)
+                                        : containsIgnoreCase(b.getAuthor(), keyword);
+            if (match) { b.display(); found = true; }
+        }
+
+        if (!found) cout << "No matching books found.\n";
+    }
+};
+
+// ------------------------------------------------------------
+// Menu-driven main function
+// ------------------------------------------------------------
+void printMenu() {
+    cout << "\n==================== LIBRARY MANAGEMENT SYSTEM ====================\n";
+    cout << "1.  Add Book\n";
+    cout << "2.  Update Book\n";
+    cout << "3.  Delete Book\n";
+    cout << "4.  View All Books\n";
+    cout << "5.  Add Member\n";
+    cout << "6.  Update Member\n";
+    cout << "7.  Delete Member\n";
+    cout << "8.  View All Members\n";
+    cout << "9.  Issue Book\n";
+    cout << "10. Return Book\n";
+    cout << "11. View Issued Books\n";
+    cout << "12. Search Books (by Title/Author)\n";
+    cout << "13. Exit\n";
+    cout << "=====================================================================\n";
+}
+
+int main() {
+    Library library;
+    bool running = true;
+
+    cout << "Welcome to the Library Management System\n";
+
+    while (running) {
+        printMenu();
+        int choice = readInt("Enter your choice: ");
+
+        try {
+            switch (choice) {
+                case 1: library.addBook(); break;
+                case 2: library.updateBook(); break;
+                case 3: library.deleteBook(); break;
+                case 4: library.viewAllBooks(); break;
+                case 5: library.addMember(); break;
+                case 6: library.updateMember(); break;
+                case 7: library.deleteMember(); break;
+                case 8: library.viewAllMembers(); break;
+                case 9: library.issueBook(); break;
+                case 10: library.returnBook(); break;
+                case 11: library.viewIssuedBooks(); break;
+                case 12: library.searchBooks(); break;
+                case 13:
+                    cout << "Thank you for using the Library Management System. Goodbye!\n";
+                    running = false;
+                    break;
+                default:
+                    cout << "Invalid choice. Please select a valid option (1-13).\n";
+            }
+        } catch (const exception &e) {
+            cout << "An error occurred: " << e.what() << "\n";
+        }
+    }
+
+    return 0;
+}
